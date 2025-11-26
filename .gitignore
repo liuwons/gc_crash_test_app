@@ -1,0 +1,27 @@
+# Built application files
+*.apk
+*.ap_
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java class files
+*.class
+
+# Generated files
+bin/
+build/
+.gradle/
+.idea/
+captures/
+.navigation/
+externalNativeBuild.cxx/
+
+# Local configuration files (user-specific)
+local.properties
+.DS_Store # macOS specific
+*.iml # IntelliJ/Android Studio module files
+
+# Keystore files (sensitive information)
+*.jks
+*.keystore
