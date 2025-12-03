@@ -14,10 +14,24 @@
 // Global state
 static jmethodID g_hooked_getCallingUid = nullptr;
 static void* g_original_getCallingUid = nullptr;
-static int g_native_function_offset = -1;
 static bool g_hook_active = false;
 static JavaVM* g_jvm = nullptr;
 static int g_api_level = 0;
+
+// ArtMethod offsets and trampoline
+struct ArtMethodConfig {
+    size_t size = 0;
+    size_t access_flags_offset = 0;
+    size_t data_offset = 0;
+    size_t entry_point_from_quick_compiled_code_offset = 0;
+    void* generic_jni_trampoline = nullptr;
+    bool initialized = false;
+} g_art_config;
+
+// Constants
+constexpr uint32_t kAccCriticalNative = 0x00100000;
+constexpr uint32_t kAccFastNative = 0x00080000;
+constexpr uint32_t kAccNative = 0x0100;
 
 // For calling back to Java from hooked method
 static jclass g_mainActivityClass = nullptr;
@@ -105,20 +119,131 @@ static void original_nativeMark(JNIEnv* env, jclass clazz) {
     LOGD("original_nativeMark called");
 }
 
+constexpr uint32_t kAccPublic = 0x0001;
+constexpr uint32_t kAccStatic = 0x0008;
+
+static bool initArtConfig(JNIEnv* env) {
+    if (g_art_config.initialized) return true;
+
+    LOGI("Initializing ArtMethod configuration (Robust Scan)...");
+
+    // 1. Register a dummy native method to use as a template
+    jclass mainActivity = env->FindClass("com/test/gccrash/MainActivity");
+    if (!mainActivity) {
+        LOGE("Failed to find MainActivity class");
+        return false;
+    }
+
+    JNINativeMethod method = {
+            const_cast<char*>("nativeMark"),
+            const_cast<char*>("()V"),
+            reinterpret_cast<void*>(original_nativeMark)
+    };
+
+    if (env->RegisterNatives(mainActivity, &method, 1) < 0) {
+        LOGE("Failed to register nativeMark");
+        return false;
+    }
+
+    jmethodID mid = env->GetStaticMethodID(mainActivity, "nativeMark", "()V");
+    uintptr_t artMethod = getArtMethodPointer(env, mid, mainActivity, true);
+
+    if (artMethod == 0) {
+        LOGE("Failed to get ArtMethod pointer for nativeMark");
+        return false;
+    }
+
+    // 2. Scan for data_offset (pointer to original_nativeMark)
+    // We search a reasonable range (e.g. 0 to 128 bytes)
+    bool foundData = false;
+    uintptr_t targetFunc = reinterpret_cast<uintptr_t>(original_nativeMark);
+
+    for (size_t i = 0; i < 128; i += sizeof(void*)) {
+        uintptr_t val = *reinterpret_cast<uintptr_t*>(artMethod + i);
+        if (val == targetFunc) {
+            g_art_config.data_offset = i;
+            foundData = true;
+            LOGI("Found data_offset: %zu", i);
+            break;
+        }
+    }
+
+    if (!foundData) {
+        LOGE("Failed to find data_offset in ArtMethod");
+        return false;
+    }
+
+    // 3. Scan for access_flags_offset
+    // nativeMark is static public native:
+    // kAccPublic(0x1) | kAccStatic(0x8) | kAccNative(0x100) = 0x109
+    // But runtime flags might be set. We check for essential flags (STATIC | NATIVE).
+    uint32_t requiredFlags = kAccStatic | kAccNative;
+    uint32_t mask = 0xFFFF; // Check low 16 bits (Java access flags)
+    bool foundFlags = false;
+
+    // We search up to data_offset because flags are usually before data
+    for (size_t i = 0; i < g_art_config.data_offset; i += 4) {
+        uint32_t val = *reinterpret_cast<uint32_t*>(artMethod + i);
+
+        // Log potential candidates for debugging
+        if ((val & mask & requiredFlags) == requiredFlags) {
+            LOGI("Potential access_flags candidate at offset %zu: 0x%x", i, val);
+
+            // Prefer the first one that matches expected pattern or if it exactly matches expected public flags
+            if ((val & mask) == (kAccPublic | kAccStatic | kAccNative)) {
+                g_art_config.access_flags_offset = i;
+                foundFlags = true;
+                LOGI("Found exact access_flags_offset: %zu", i);
+                break;
+            }
+
+            // If we haven't found a "perfect" match yet, take this one as tentative
+            if (!foundFlags) {
+                g_art_config.access_flags_offset = i;
+                foundFlags = true;
+                LOGI("Found tentative access_flags_offset: %zu", i);
+            }
+        }
+    }
+
+    if (!foundFlags) {
+        // Fallback: assume offset 4 if not found (very common)
+        LOGW("Could not find access_flags with mask, defaulting to 4");
+
+        // Log value at offset 4 to see what it was
+        uint32_t val4 = *reinterpret_cast<uint32_t*>(artMethod + 4);
+        LOGW("Value at offset 4: 0x%x", val4);
+
+        g_art_config.access_flags_offset = 4;
+    } else {
+        LOGI("Confirmed access_flags_offset: %zu", g_art_config.access_flags_offset);
+    }
+
+    // 4. Derive entry_point_from_quick_compiled_code_offset
+    // Convention: it follows data_offset
+    g_art_config.entry_point_from_quick_compiled_code_offset = g_art_config.data_offset + sizeof(void*);
+    LOGI("Derived entry_point_from_quick_compiled_code_offset: %zu", g_art_config.entry_point_from_quick_compiled_code_offset);
+
+    // 5. Get Generic JNI Trampoline
+    // Since nativeMark is not compiled (registered dynamically), its entry point IS the generic JNI trampoline
+    g_art_config.generic_jni_trampoline = *reinterpret_cast<void**>(artMethod + g_art_config.entry_point_from_quick_compiled_code_offset);
+    LOGI("Generic JNI Trampoline: %p", g_art_config.generic_jni_trampoline);
+
+    g_art_config.initialized = true;
+    return true;
+}
+
 typedef jint (*OriginalGetCallingUid)();
 
-static jint hooked_getCallingUid() {
+static jint hooked_getCallingUid(JNIEnv* env, jclass clazz) {
     jint originalUid = 0;
     if (g_original_getCallingUid) {
+        // Call original as a simple function (it was CriticalNative)
         auto origFunc = reinterpret_cast<OriginalGetCallingUid>(g_original_getCallingUid);
         originalUid = origFunc();
         LOGI("Original getCallingUid returned: %d", originalUid);
-    }
-    
-    JNIEnv* env = GetJNIEnv();
-    if (!env) {
-        LOGE("Failed to get JNIEnv!");
-        return originalUid;
+    } else {
+        LOGE("Original getCallingUid is null!");
     }
     
     if (g_mainActivityClass && g_onGetCallingUidMethod) {
@@ -141,95 +266,59 @@ static jint hooked_getCallingUid() {
     return originalUid;
 }
 
-static bool measureNativeOffset(JNIEnv* env, jclass mainActivity) {
-    LOGD("Measuring native function offset in ArtMethod structure...");
-    LOGD("Android API level: %d", g_api_level);
-    
-    // Register original function to get a reference
-    JNINativeMethod method = {
-        const_cast<char*>("nativeMark"),
-        const_cast<char*>("()V"),
-        reinterpret_cast<void*>(original_nativeMark)
-    };
-    
-    if (env->RegisterNatives(mainActivity, &method, 1) < 0) {
-        LOGE("Failed to register native method");
+static bool artHookMethod(JNIEnv* env, jmethodID method, jclass clazz, void* new_func, void** old_func, bool isCritical) {
+    if (!g_art_config.initialized) {
+        LOGE("ArtConfig not initialized");
         return false;
     }
-    
-    // Get the jmethodID
-    jmethodID mid = env->GetStaticMethodID(mainActivity, "nativeMark", "()V");
-    if (!mid) {
-        LOGE("Failed to get method ID");
-        return false;
-    }
-    
-    // Convert jmethodID to actual ArtMethod pointer (handles Android R+ index-based IDs)
-    uintptr_t artMethodPtr = getArtMethodPointer(env, mid, mainActivity, true);
-    if (artMethodPtr == 0) {
-        LOGE("Failed to get ArtMethod pointer");
-        return false;
-    }
-    
-    // Search for the function pointer in the ArtMethod structure
-    auto start = artMethodPtr;
-    auto target = reinterpret_cast<uintptr_t>(original_nativeMark);
-    
-    LOGD("Searching for function pointer:");
-    LOGD("  ArtMethod address: 0x%lx", start);
-    LOGD("  Target function:   0x%lx", target);
-    
-    // Search up to 200 bytes (covers ArtMethod structure in most cases)
-    for (int offset = 0; offset < 200; offset += 8) {  // 8-byte aligned for 64-bit
-        uintptr_t* ptr = reinterpret_cast<uintptr_t*>(start + offset);
-        if (*ptr == target) {
-            g_native_function_offset = offset;
-            LOGI("Found native function pointer at offset: %d", offset);
-            
-            // Log the surrounding structure for debugging
-            LOGD("ArtMethod structure around offset %d:", offset);
-            for (int i = -16; i <= 16; i += 8) {
-                uintptr_t* p = reinterpret_cast<uintptr_t*>(start + offset + i);
-                LOGD("  [%+3d] 0x%016lx", i, *p);
-            }
-            
-            return true;
-        }
-    }
-    
-    LOGE("Failed to find native function pointer in ArtMethod");
-    return false;
-}
 
-static bool artSetJNIFunction(JNIEnv* env, jmethodID method, jclass clazz, void* new_func, void** old_func) {
-    if (g_native_function_offset < 0) {
-        LOGE("Native offset not measured");
-        return false;
-    }
-    
-    // Get actual ArtMethod pointer (handles Android R+ index-based jmethodID)
+    // Get actual ArtMethod pointer
     uintptr_t method_addr = getArtMethodPointer(env, method, clazz, true);
     if (method_addr == 0) {
         LOGE("Failed to get ArtMethod pointer for hooking");
         return false;
     }
-    
-    auto func_ptr = reinterpret_cast<void**>(method_addr + g_native_function_offset);
-    
-    // Save original
-    if (old_func) {
-        *old_func = *func_ptr;
-    }
-    
-    LOGI("Hooking JNI function:");
-    LOGI("  ArtMethod address: 0x%lx", method_addr);
-    LOGI("  Offset:            %d", g_native_function_offset);
-    LOGI("  Original function: 0x%lx", reinterpret_cast<uintptr_t>(*func_ptr));
-    LOGI("  New function:      0x%lx", reinterpret_cast<uintptr_t>(new_func));
 
-    *func_ptr = new_func;
-    
-    LOGI("✓ JNI function pointer replaced");
+    LOGI("Hooking method at 0x%lx", method_addr);
+
+    // 1. Update data_ (JNI entry point)
+    void** data_ptr = reinterpret_cast<void**>(method_addr + g_art_config.data_offset);
+    if (old_func) {
+        *old_func = *data_ptr;
+    }
+    *data_ptr = new_func;
+    LOGI("  Updated data_: %p -> %p", (old_func ? *old_func : nullptr), new_func);
+
+    // 2. Update entry_point_from_quick_compiled_code_ to Generic JNI Trampoline
+    // This ensures ART treats it as a non-compiled native method and goes through the generic JNI stub
+    // which handles the JNIEnv setup and state transition correctly.
+    void** entry_point_ptr = reinterpret_cast<void**>(method_addr + g_art_config.entry_point_from_quick_compiled_code_offset);
+    *entry_point_ptr = g_art_config.generic_jni_trampoline;
+    LOGI("  Updated entry_point: %p", g_art_config.generic_jni_trampoline);
+
+    // 3. Update Access Flags
+    // Remove CriticalNative/FastNative flags so ART treats it as a regular native method.
+    // This is crucial for the Generic JNI Trampoline to work correctly and for GC to walk the stack.
+    uint32_t* access_flags_ptr = reinterpret_cast<uint32_t*>(method_addr + g_art_config.access_flags_offset);
+    uint32_t old_flags = *access_flags_ptr;
+
+    // Check for CriticalNative flags and log them
+    if (isCritical) {
+        LOGI("  Original flags before stripping: 0x%x", old_flags);
+        if (old_flags & kAccCriticalNative) LOGI("    Has kAccCriticalNative (0x%x)", kAccCriticalNative);
+        if (old_flags & 0x00200000) LOGI("    Has 0x00200000");
+    }
+
+    // Strip both standard CriticalNative (0x00200000) and user-provided/alternative (0x00100000) just to be safe
+    // Also strip FastNative
+    uint32_t new_flags = old_flags & ~(kAccCriticalNative | 0x00200000 | kAccFastNative);
+
+    // Ensure kAccNative is set (it should be already)
+    new_flags |= kAccNative;
+
+    *access_flags_ptr = new_flags;
+    LOGI("  Updated access_flags: 0x%x -> 0x%x", old_flags, new_flags);
+
     return true;
 }
 
@@ -281,10 +370,11 @@ static bool hookFrameworkMethods(JNIEnv* env) {
         jmethodID getCallingUid = env->GetStaticMethodID(binderClass, "getCallingUid", "()I");
         if (getCallingUid) {
             g_hooked_getCallingUid = getCallingUid;
-            
-            if (artSetJNIFunction(env, getCallingUid, binderClass,
-                                 reinterpret_cast<void*>(hooked_getCallingUid),
-                                 &g_original_getCallingUid)) {
+
+            // This IS a CriticalNative method, so pass true
+            if (artHookMethod(env, getCallingUid, binderClass,
+                              reinterpret_cast<void*>(hooked_getCallingUid),
+                              &g_original_getCallingUid, true)) {
                 LOGI("✓ Successfully hooked Binder.getCallingUid");
             } else {
                 LOGE("✗ Failed to hook Binder.getCallingUid");
@@ -328,23 +418,13 @@ Java_com_test_gccrash_MainActivity_initHook(JNIEnv* env, jobject thiz) {
         }
         env->DeleteLocalRef(versionClass);
     }
-    
-    // Get MainActivity class for measuring offset
-    jclass mainActivity = env->FindClass("com/test/gccrash/MainActivity");
-    if (!mainActivity) {
-        LOGE("Failed to find MainActivity class");
+
+    // Initialize offsets and config
+    if (!initArtConfig(env)) {
+        LOGE("Failed to initialize ART config");
         return;
     }
-    
-    // Measure offset using our test method
-    if (!measureNativeOffset(env, mainActivity)) {
-        LOGE("Failed to measure native offset");
-        env->DeleteLocalRef(mainActivity);
-        return;
-    }
-    
-    env->DeleteLocalRef(mainActivity);
-    
+
     // Now hook the actual framework methods
     if (!hookFrameworkMethods(env)) {
         LOGE("Failed to hook any framework methods");
