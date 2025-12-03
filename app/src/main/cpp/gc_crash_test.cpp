@@ -12,12 +12,8 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 // Global state
-static jmethodID g_original_mark_method = nullptr;
 static jmethodID g_hooked_getCallingUid = nullptr;
-static jmethodID g_hooked_nativeLoad = nullptr;
-static void* g_original_jni_function = nullptr;
 static void* g_original_getCallingUid = nullptr;
-static void* g_original_nativeLoad = nullptr;
 static int g_native_function_offset = -1;
 static bool g_hook_active = false;
 static JavaVM* g_jvm = nullptr;
@@ -145,34 +141,6 @@ static jint hooked_getCallingUid() {
     return originalUid;
 }
 
-static jstring hooked_nativeLoad(JNIEnv* env, jclass clazz, jstring javaLibPath,
-                                 jobject classLoader, jclass caller) {
-    usleep(100000);
-    
-    return nullptr;
-}
-
-static void hooked_nativeMark(JNIEnv* env, jclass clazz) {
-    LOGI("=== Inside Hooked nativeMark ===");
-
-    usleep(100000);  // 100ms
-    
-    jclass systemClass = env->FindClass("java/lang/System");
-    if (systemClass) {
-        jmethodID gcMethod = env->GetStaticMethodID(systemClass, "gc", "()V");
-        if (gcMethod) {
-            for (int i = 0; i < 10; i++) {
-                LOGI("GC trigger %d/10...", i + 1);
-                env->CallStaticVoidMethod(systemClass, gcMethod);
-                usleep(10000);
-            }
-        }
-        env->DeleteLocalRef(systemClass);
-    }
-    
-    LOGI("=== Exiting Hooked nativeMark ===");
-}
-
 static bool measureNativeOffset(JNIEnv* env, jclass mainActivity) {
     LOGD("Measuring native function offset in ArtMethod structure...");
     LOGD("Android API level: %d", g_api_level);
@@ -195,8 +163,6 @@ static bool measureNativeOffset(JNIEnv* env, jclass mainActivity) {
         LOGE("Failed to get method ID");
         return false;
     }
-    
-    g_original_mark_method = mid;
     
     // Convert jmethodID to actual ArtMethod pointer (handles Android R+ index-based IDs)
     uintptr_t artMethodPtr = getArtMethodPointer(env, mid, mainActivity, true);
@@ -307,7 +273,6 @@ static bool hookFrameworkMethods(JNIEnv* env) {
         LOGE("Failed to set up Java callback - crash may not occur");
     }
     
-    // 1. Hook Binder.getCallingUid
     LOGI("\n--- Hooking Binder.getCallingUid ---");
     LOGI("");
     
@@ -333,46 +298,7 @@ static bool hookFrameworkMethods(JNIEnv* env) {
         LOGE("✗ Failed to find Binder class");
     }
     
-    // 2. Hook Runtime.nativeLoad (Android 10+)
-    LOGI("\n--- Hooking Runtime.nativeLoad ---");
-    jclass runtimeClass = env->FindClass("java/lang/Runtime");
-    if (runtimeClass) {
-        // Try different signatures for different Android versions
-        const char* signatures[] = {
-            "(Ljava/lang/String;Ljava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/String;", // Android 10+
-            "(Ljava/lang/String;Ljava/lang/ClassLoader;Ljava/lang/String;)Ljava/lang/String;", // Older
-            "(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/String;"  // Even older
-        };
-        
-        jmethodID nativeLoad = nullptr;
-        for (const char* sig : signatures) {
-            nativeLoad = env->GetStaticMethodID(runtimeClass, "nativeLoad", sig);
-            if (nativeLoad) {
-                LOGI("Found nativeLoad with signature: %s", sig);
-                break;
-            }
-            env->ExceptionClear();
-        }
-        
-        if (nativeLoad) {
-            g_hooked_nativeLoad = nativeLoad;
-            
-            if (artSetJNIFunction(env, nativeLoad, runtimeClass,
-                                 reinterpret_cast<void*>(hooked_nativeLoad),
-                                 &g_original_nativeLoad)) {
-                LOGI("✓ Successfully hooked Runtime.nativeLoad");
-            } else {
-                LOGE("✗ Failed to hook Runtime.nativeLoad");
-            }
-        } else {
-            LOGE("✗ Failed to find Runtime.nativeLoad method");
-        }
-        env->DeleteLocalRef(runtimeClass);
-    } else {
-        LOGE("✗ Failed to find Runtime class");
-    }
-    
-    return (g_hooked_getCallingUid != nullptr) || (g_hooked_nativeLoad != nullptr);
+    return g_hooked_getCallingUid != nullptr;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -436,7 +362,6 @@ Java_com_test_gccrash_MainActivity_initHook(JNIEnv* env, jobject thiz) {
         LOGI("  ✓ Binder.getCallingUid");
         LOGI("    -> Will call Java onGetCallingUid()");
     }
-    if (g_hooked_nativeLoad) LOGI("  ✓ Runtime.nativeLoad");
     LOGI("");
     LOGI("Java callback:");
     if (g_onGetCallingUidMethod) {

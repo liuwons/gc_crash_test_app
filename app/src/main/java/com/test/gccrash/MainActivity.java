@@ -28,11 +28,11 @@ public class MainActivity extends Activity {
         Log.i(TAG, "=== onGetCallingUid called from native hook ===");
         Log.i(TAG, "Original UID: " + originalUid);
 
-        try {
-            Thread.sleep(200);
-        } catch (InterruptedException e) {
-            Log.e(TAG, "Sleep interrupted", e);
-        }
+//        try {
+//            Thread.sleep(200);
+//        } catch (InterruptedException e) {
+//            Log.e(TAG, "Sleep interrupted", e);
+//        }
         
         // Allocate some objects to encourage GC
         for (int i = 0; i < 100; i++) {
