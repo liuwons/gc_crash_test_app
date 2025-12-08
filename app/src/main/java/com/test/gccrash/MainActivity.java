@@ -19,30 +19,6 @@ public class MainActivity extends Activity {
         System.loadLibrary("gccrashtest");
     }
 
-    private native void initHook();
-    private native boolean isHookActive();
-    
-    private static native void nativeMark();
-    
-    public static int onGetCallingUid(int originalUid) {
-        Log.i(TAG, "=== onGetCallingUid called from native hook ===");
-        Log.i(TAG, "Original UID: " + originalUid);
-
-//        try {
-//            Thread.sleep(200);
-//        } catch (InterruptedException e) {
-//            Log.e(TAG, "Sleep interrupted", e);
-//        }
-        
-        // Allocate some objects to encourage GC
-        for (int i = 0; i < 100; i++) {
-            byte[] garbage = new byte[1024 * 100]; // 100KB allocations
-        }
-        
-        Log.i(TAG, "=== onGetCallingUid returning ===");
-        return originalUid;
-    }
-
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -57,13 +33,8 @@ public class MainActivity extends Activity {
         title.setPadding(0, 0, 0, 32);
         layout.addView(title);
         
-        Button hookButton = new Button(this);
-        hookButton.setText("1. Initialize Hook (artSetJNIFunction)");
-        hookButton.setOnClickListener(v -> initializeHook());
-        layout.addView(hookButton);
-        
         Button triggerButton = new Button(this);
-        triggerButton.setText("2. Trigger Crash (Call Framework Methods)");
+        triggerButton.setText("Trigger Crash (Call Framework Methods)");
         triggerButton.setOnClickListener(v -> triggerCrash());
         layout.addView(triggerButton);
         
@@ -88,27 +59,6 @@ public class MainActivity extends Activity {
         log("");
     }
 
-    private void initializeHook() {
-        log("=== Initializing Hook ===");
-        try {
-            // Register our native marker method
-            Method markMethod = MainActivity.class.getDeclaredMethod("nativeMark");
-            
-            log("Calling initHook() to hook Binder.getCallingUid()...");
-            initHook();
-            
-            if (isHookActive()) {
-                log("✓ Hook initialized successfully!");
-            } else {
-                log("✗ Hook initialization failed");
-            }
-        } catch (Exception e) {
-            log("✗ Error: " + e.getMessage());
-            Log.e(TAG, "Hook init error", e);
-        }
-        log("");
-    }
-
     private void triggerCrash() {
         log("=== Triggering Crash ===");
         log("");
@@ -122,7 +72,8 @@ public class MainActivity extends Activity {
             while (running[0] && count < 1000000) {
                 try {
                     count++;
-                    int uid = android.os.Binder.getCallingUid();  // Sleeps 200ms inside hook
+                    int uid = android.os.Binder.getCallingUid();
+                    Thread.sleep(1);
                     if (count % 10 == 0) {
                         Log.i(TAG, "Caller: completed " + count + " calls");
                     }
@@ -147,7 +98,7 @@ public class MainActivity extends Activity {
             for (int i = 0; i < 500000 && running[0]; i++) {
                 try {
                     // Allocate 5MB chunks
-                    garbage.add(new byte[5 * 1024 * 1024]);
+                    garbage.add(new byte[5 * 1024]);
                     
                     // Trigger GC
                     System.gc();
@@ -157,7 +108,7 @@ public class MainActivity extends Activity {
                         Log.i(TAG, "GC thread: allocated " + (i * 5) + "MB, GC triggered");
                     }
                     
-                    Thread.sleep(100);
+                    Thread.sleep(50);
                 } catch (OutOfMemoryError e) {
                     Log.i(TAG, "GC thread: OOM - clearing garbage");
                     garbage.clear();
@@ -178,24 +129,6 @@ public class MainActivity extends Activity {
         
         log("Starting GC thread (memory allocation + GC triggers)...");
         gcThread.start();
-        
-        log("");
-        
-        // Monitor threads
-        new Thread(() -> {
-            try {
-                callerThread.join(20000000);
-                gcThread.join(200000000);
-                running[0] = false;
-                
-                runOnUiThread(() -> {
-                    log("");
-                    log("Test completed without crash.");
-                    log("");
-                });
-            } catch (InterruptedException e) {
-            }
-        }).start();
     }
 
     private void log(String message) {
